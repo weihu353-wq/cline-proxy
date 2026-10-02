@@ -1,0 +1,13 @@
+# Build the reliability branch while preserving the pinned upstream runtime.
+# The r3 changes are already part of this branch; do not apply the patch again.
+# See docs/fork-maintenance.md for source provenance and validation commands.
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /out/cline-proxy .
+
+FROM ghcr.io/foxy1402/cline-proxy@sha256:664318da74eade0003c9f7a75fe506e6c4ceef3e2e10f26264cc04252d42890c
+COPY --from=builder /out/cline-proxy /app/cline-proxy

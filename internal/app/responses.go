@@ -386,6 +386,23 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				if json.Unmarshal([]byte(payload), &obj) != nil {
 					continue
 				}
+				// Check the original envelope before unwrapping its data field so an
+				// outer error cannot be discarded by a valid-looking inner payload.
+				if sseEventHasError(obj) {
+					s.event("response.failed", map[string]any{
+						"type": "response.failed",
+						"response": map[string]any{
+							"id":         s.respID,
+							"object":     "response",
+							"created_at": time.Now().Unix(),
+							"status":     "failed",
+							"model":      model,
+							"output":     []any{},
+							"error":      map[string]any{"code": "upstream_error", "message": "upstream stream failed"},
+						},
+					})
+					return
+				}
 				if data, ok := obj["data"]; ok {
 					if d, ok := data.(map[string]any); ok {
 						obj = d
@@ -706,9 +723,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	up, acc, streamed, err := callClineAutoStream(r.Context(), chat, stream, useProxies)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
+		writeClineAPIError(w, err)
 		return
 	}
 	defer up.Body.Close()
@@ -718,6 +733,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	usageFn := accountUsageFn(acc, chat)
 	if isStream {
+		if err := prepareClineSSE(up); err != nil {
+			log.Printf("  responses stream preflight failed: %s", clineSSEPreflightCode(err))
+			writeClineAPIError(w, err)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -729,7 +749,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if stream {
 		out, err := collectStreamResponse(up)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeClineAPIError(w, err)
 			return
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {

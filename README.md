@@ -1,5 +1,12 @@
 # Cline Proxy
 
+## Reliability fork
+
+This fork keeps upstream history on `main` and the reviewed r3 changes on
+[`codex/cline-reliability-r3`](https://github.com/weihu353-wq/cline-proxy/tree/codex/cline-reliability-r3).
+See [fork maintenance](docs/fork-maintenance.md) for the source baseline,
+error/streaming changes, validation commands and `Dockerfile.reliability`.
+
 A single Go binary that turns free upstream LLM quotas (Cline accounts + opencode zen free models) into one clean **OpenAI-compatible `/v1` gateway** for coding IDEs — Cursor, ZCode, Cline, Claude Code, OpenClaw — with account pooling, per-request proxy rotation, and an English admin panel.
 
 Fork-in-progress of [YuJunZhiXue/Cline-proxy](https://github.com/YuJunZhiXue/Cline-proxy), reworked for solo public deployment. This project is not affiliated with Cline or opencode; use their free tiers respectfully.

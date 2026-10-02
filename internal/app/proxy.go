@@ -148,7 +148,7 @@ func StartProxy(host string, port int) error {
 			valid := false
 			for _, k := range keys {
 				if subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
-							break
+					break
 				}
 			}
 
@@ -299,9 +299,7 @@ func StartProxy(host string, port int) error {
 		resp, acc, streamed, err := callClineAutoStream(r.Context(), params, upstreamStream, useProxies)
 		if err != nil {
 			log.Printf("  api error: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": map[string]string{"message": err.Error(), "type": "api_error"},
-			})
+			writeClineAPIError(w, err)
 			return
 		}
 		defer resp.Body.Close()
@@ -312,6 +310,11 @@ func StartProxy(host string, port int) error {
 		usageFn := accountUsageFn(acc, params)
 
 		if isStream {
+			if err := prepareClineSSE(resp); err != nil {
+				log.Printf("  cline stream preflight failed: %s", clineSSEPreflightCode(err))
+				writeClineAPIError(w, err)
+				return
+			}
 			handleStreamResponseWithUsage(w, resp, usageFn)
 			return
 		}
@@ -319,9 +322,7 @@ func StartProxy(host string, port int) error {
 		if upstreamStream {
 			out, err := collectStreamResponse(resp)
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{
-					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
-				})
+				writeClineAPIError(w, err)
 				return
 			}
 			if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
@@ -1008,19 +1009,20 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// Mark account on cooldown on rate limits
+		// Only a known account inference-cap shape cools this account. A team or
+		// regional TPM limit is shared by accounts and must be returned with its
+		// recovery hint instead of poisoning the local account pool.
+		apiErr := newClineAPIError(resp.StatusCode, kit.Truncate(string(bodyBytes), 500), resp.Header.Get("Retry-After"))
 		if resp.StatusCode == 429 {
-			reason := kit.Truncate(string(bodyBytes), 500)
-			duration := parseInferenceCapDuration(string(bodyBytes))
-			if duration <= 0 {
-				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
+			if apiErr.RateLimitScope == clineRateLimitAccount {
+				duration := parseInferenceCapDuration(string(bodyBytes))
+				markAccountCooldown(acc, "account inference cap", duration)
+				log.Printf("  account inference cap reached; cooldown %v", duration)
 			}
-			markAccountCooldown(acc, "429: "+reason, duration)
-			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
 		}
 		// 非 200 一律返回 error（body 已读尽并关闭），但状态码 + 错误体本身有价值：
 		// 类型化错误把它带出来，供 callClineAutoStream 识别"该模型必须流式"的指纹。
-		return nil, acc, &clineAPIError{Status: resp.StatusCode, Body: kit.Truncate(string(bodyBytes), 500)}
+		return nil, acc, apiErr
 	}
 
 	bumpUsage(acc)
@@ -1087,10 +1089,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		log.Printf("  streaming not supported for client, falling back to SSE-wrapped aggregation")
 		out, err := collectStreamResponse(upstream)
 		if err != nil {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("data: {\"error\":{\"message\":\"aggregation failed\",\"type\":\"parse_error\"}}\n\n"))
-			w.Write([]byte("data: [DONE]\n\n"))
+			writeClineAPIError(w, err)
 			return
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
@@ -1189,6 +1188,17 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+				if sseEventHasError(obj) {
+					// HTTP 200 is already committed once output has started. Emit a
+					// sanitized terminal SSE error and close, instead of forwarding
+					// the upstream body or pretending the stream completed.
+					safe := map[string]any{"error": map[string]string{"message": "upstream stream failed", "type": "api_error"}}
+					if encoded, marshalErr := json.Marshal(safe); marshalErr == nil {
+						w.Write([]byte("data: " + string(encoded) + "\n\n"))
+						flusher.Flush()
+					}
+					return
+				}
 				if onUsage != nil {
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						onUsage(u)
@@ -2258,9 +2268,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	resp, acc, streamed, err := callClineAutoStream(r.Context(), openAIReq, upstreamStream, useProxies)
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
+		writeClineAPIError(w, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -2271,6 +2279,11 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	usageFn := accountUsageFn(acc, openAIReq)
 
 	if req.Stream {
+		if err := prepareClineSSE(resp); err != nil {
+			log.Printf("  anthropic stream preflight failed: %s", clineSSEPreflightCode(err))
+			writeClineAPIError(w, err)
+			return
+		}
 		handleAnthropicStreamWithUsage(w, resp, normalizeRequestModel(req.Model), toolSchemas, stopSequencesFrom(openAIReq), usageFn)
 		return
 	}
@@ -2278,9 +2291,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if upstreamStream {
 		out, err := collectStreamResponse(resp)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
-			})
+			writeClineAPIError(w, err)
 			return
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
@@ -2512,9 +2523,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		log.Printf("  anthropic stream: streaming not supported for client, falling back to non-stream aggregation")
 		out, err := collectStreamResponse(upstream)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
-			})
+			writeClineAPIError(w, err)
 			return
 		}
 		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
@@ -2637,6 +2646,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		})
 	}
 
+	upstreamSSEError := false
 	processSSELine := func(line string) {
 		line = strings.TrimRight(line, "\r\n")
 		if !strings.HasPrefix(line, "data:") {
@@ -2657,17 +2667,19 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 				onUsage(u)
 			}
 		}
+		if sseEventHasError(obj) {
+			upstreamSSEError = true
+			log.Printf("  upstream SSE error")
+			emit("error", map[string]any{
+				"type":  "error",
+				"error": map[string]any{"type": "api_error", "message": "upstream stream failed"},
+			})
+			return
+		}
 		if data, ok := obj["data"]; ok {
 			if d, ok := data.(map[string]any); ok {
 				obj = d
 			}
-		}
-
-		if errPayload, ok := obj["error"]; ok {
-			errBody, _ := json.Marshal(errPayload)
-			log.Printf("  upstream SSE error: %s", string(errBody))
-			emit("error", map[string]any{"type": "error", "error": errPayload})
-			return
 		}
 
 		choices, _ := getNested(obj, "choices").([]any)
@@ -2761,6 +2773,9 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		line, err := reader.ReadString('\n')
 		if line != "" {
 			processSSELine(line)
+			if upstreamSSEError {
+				break
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -2768,6 +2783,9 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			}
 			break
 		}
+	}
+	if upstreamSSEError {
+		return
 	}
 
 	// Stop text block if active

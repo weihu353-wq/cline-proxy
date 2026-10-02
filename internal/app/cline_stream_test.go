@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -20,7 +21,7 @@ func fakeUpstream(status int, body string) *http.Response {
 }
 
 // 假上游必须复刻 callClineAPI 的真实契约：非 200 时返回 nil 响应 + *clineAPIError
-//（响应体在 callee 里已读尽并关闭）。早期版本返回 (500 响应, nil error) —— 那是
+// （响应体在 callee 里已读尽并关闭）。早期版本返回 (500 响应, nil error) —— 那是
 // 生产里不存在的形态，导致学习逻辑在真实上游面前永远不会触发。
 func fakeUpstreamErr(status int, body string) (*http.Response, *Account, error) {
 	return nil, &Account{Email: "err@x"}, &clineAPIError{Status: status, Body: body}
@@ -73,9 +74,9 @@ func TestCallClineAutoStreamLearnsAndRetries(t *testing.T) {
 	}
 }
 
-// 重试也失败时：交回第一次的错误（调用方照旧报上游错误），且不谎报 streamed；
-// 模型仍被学习，因此后续请求不会再走这条非流式失败路径。
-func TestCallClineAutoStreamRetryFailureKeepsOriginalError(t *testing.T) {
+// 重试也失败时：交回最后一次错误（它可能包含当前的429和Retry-After），且不
+// 谎报 streamed；模型仍被学习，因此后续请求不会再走这条非流式失败路径。
+func TestCallClineAutoStreamRetryFailureReturnsLatestError(t *testing.T) {
 	t.Setenv("DATA_DIR", t.TempDir())
 	clineStreamMu.Lock()
 	clineStreamLearned = nil
@@ -101,8 +102,8 @@ func TestCallClineAutoStreamRetryFailureKeepsOriginalError(t *testing.T) {
 	if resp != nil {
 		t.Fatal("no response body exists for a non-200 upstream reply")
 	}
-	if !strings.Contains(err.Error(), "empty response content") {
-		t.Fatalf("the first failure should be reported, got %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the latest failure should be reported, got %v", err)
 	}
 	if !clineStreamRequired("z-ai/glm-5.3-flash") {
 		t.Fatal("model must still be learned even when the retry failed")

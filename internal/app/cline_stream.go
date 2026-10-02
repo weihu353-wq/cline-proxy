@@ -56,8 +56,10 @@ func clineEmptyStreamErr(status int, body []byte) bool {
 // 后返回 error，调用方拿不到 *http.Response；但"该模型必须流式"的判定只需要状态码
 // + 错误体，用类型化错误把它们带出来即可，无需改动"非 200 返回 nil 响应"的既有约定。
 type clineAPIError struct {
-	Status int
-	Body   string
+	Status         int
+	Body           string
+	RetryAfter     string
+	RateLimitScope clineRateLimitScope
 }
 
 func (e *clineAPIError) Error() string {
@@ -135,8 +137,13 @@ func saveClineStream(learned map[string]string) {
 	}
 }
 
-// clineCallFn 上游调用入口：包级变量便于测试注入假上游，生产恒为 callClineAPI。
-var clineCallFn = callClineAPI
+// clineRawCallFn 是单次上游调用入口。生产路径由有界账号故障转移包装它；
+// 测试可替换该变量，验证不会在已开始输出后重放整个请求。
+var clineRawCallFn = callClineAPI
+
+// clineCallFn 是调用方使用的入口。它仅在上游尚未返回任何字节、且可明确识别
+// 为账号级额度限制时尝试另一活跃账号；共享供应商限流不会被误当成换号信号。
+var clineCallFn = callClineWithAccountFailover
 
 // callClineAutoStream 包住 callClineAPI 兜住"命名约定猜错"的情况：非流式请求若
 // 被上游以 500 empty response content 拒绝，就学习该模型并立即改用流式重试。
@@ -163,8 +170,9 @@ func callClineAutoStream(ctx context.Context, params map[string]any, stream, use
 
 	resp2, acc2, err2 := clineCallFn(ctx, params, true, useProxies)
 	if err2 != nil {
-		// 重试也失败：把第一次的错误照旧上报（模型已学会，下一个请求直接走流式）
-		return nil, acc, false, err
+		// 重试也失败：最后一次失败更接近当前可操作状态（例如 429 和
+		// Retry-After），不能用首次 empty-response 错误覆盖它。
+		return nil, acc2, false, err2
 	}
 	if acc2 != nil {
 		acc = acc2
